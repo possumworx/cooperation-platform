@@ -5,18 +5,49 @@ Runs as clap-admin user to receive resource-share data from all Claudes
 """
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 import sqlite3
 from pathlib import Path
+import subprocess
+import tempfile
+import os
 import uvicorn
 # EMERGENCY FIX 2026-01-15: Disabled allocation calculator - using constant interval
 # from allocation_calculator import calculate_recommended_interval
 
 # Configuration
-DB_PATH = Path("/home/clap-admin/cooperation-platform/resource-sharing/data/resource_tracking.db")
-LOG_PATH = Path("/home/clap-admin/cooperation-platform/resource-sharing/logs/server.log")
+DB_PATH = Path("/home/coop-admin/cooperation-platform/resource-sharing/data/resource_tracking.db")
+LOG_PATH = Path("/home/coop-admin/cooperation-platform/resource-sharing/logs/server.log")
+
+# === ALLOCATION MODE CONFIGURATION ===
+# Mode options:
+#   "static" - All Claudes get BASE_INTERVAL (no dynamic adjustment)
+#   "fairness" - Apply fairness multiplier based on 24hr usage (lowest-user gets base, higher-users get slowed)
+#   "full" - Full V1 algorithm with fairness + quota window multipliers (future)
+ALLOCATION_MODE = "fairness"  # Fairness mode: 5-min base, proportional slowdown for higher usage (2026-03-14)
+BASE_INTERVAL = 300  # Base interval in seconds (5 minutes for snappy debate!)
+
+# === CAMERA REGISTRY ===
+# Maps camera name → device path and metadata.
+# Add new cameras here as they're connected to Orange's box.
+CAMERAS = {
+    "diningroom": {
+        "type": "v4l2",
+        "device": "/dev/video0",
+        "description": "Dining room — Orange's home view",
+        "location": "On top of the claude-cabinet",
+    },
+    "garden-path": {
+        "type": "rtsp",
+        "url": "rtsp://orange:w1ldl1fe@192.168.1.89:554/h264Preview_01_main",
+        "description": "Garden path — where the heated water bowls will go",
+        "location": "Reolink camera at garden entrance",
+    },
+    # Future examples:
+    # "hedgehogs": {"type": "v4l2", "device": "/dev/video1", "description": "Hedgehog room", "location": "..."},
+}
 
 app = FastAPI(title="Resource-Share Tracker")
 
@@ -33,6 +64,13 @@ class ResourceQuery(BaseModel):
     claude_name: str
     date: str = None  # Optional, defaults to today
 
+class PauseRequest(BaseModel):
+    claude_name: str
+    duration_minutes: int  # How long to pause in minutes
+
+class UnpauseRequest(BaseModel):
+    claude_name: str
+
 def get_db():
     """Get database connection"""
     return sqlite3.connect(DB_PATH)
@@ -42,6 +80,127 @@ def log_message(message: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_PATH, "a") as f:
         f.write(f"{timestamp} - {message}\n")
+
+# === ALLOCATION ALGORITHM FUNCTIONS ===
+
+def get_fairness_multiplier(claude_name):
+    """
+    Calculate fairness multiplier from 24hr rolling window usage.
+
+    Returns:
+        float: Multiplier for interval adjustment
+               1.0 = lowest user (no slowdown)
+               >1.0 = higher usage (proportional slowdown)
+
+    Logic: fairness_mult = my_usage / lowest_usage
+           - If I'm the lowest user: my_usage/my_usage = 1.0 (base interval)
+           - If I used more: higher_usage/lowest_usage = >1.0 (slowed down)
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Get 24hr usage for all active Claudes
+    twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+
+    cursor.execute("""
+        SELECT claude_name, SUM(normalized_usage) as total_usage
+        FROM resource_share_increments
+        WHERE timestamp >= ? AND mode = 'autonomy'
+        GROUP BY claude_name
+    """, (twenty_four_hours_ago,))
+
+    usage_by_claude = {row[0]: row[1] for row in cursor.fetchall()}
+    conn.close()
+
+    if not usage_by_claude or len(usage_by_claude) == 0:
+        return 1.0  # No usage data, use base interval
+
+    # Find lowest usage across all Claudes
+    lowest_usage = min(usage_by_claude.values())
+    my_usage = usage_by_claude.get(claude_name, 0)
+
+    # If no usage for this Claude or lowest_usage is 0, return 1.0
+    if my_usage == 0 or lowest_usage == 0:
+        return 1.0
+
+    # BUGFIX 2026-02-15: Prevent division explosion when lowest_usage is tiny
+    # Set minimum threshold to prevent insane multipliers
+    MIN_USAGE_THRESHOLD = 0.1
+    lowest_usage = max(lowest_usage, MIN_USAGE_THRESHOLD)
+
+    # fairness_mult = my_usage / lowest_usage
+    # Lowest user gets 1.0x (base interval)
+    # Higher users get >1.0x (slowed down proportionally)
+    fairness_mult = my_usage / lowest_usage
+
+    # BUGFIX 2026-02-15: Cap maximum fairness multiplier
+    # Prevents insane intervals (was getting 9+ days!)
+    MAX_FAIRNESS_MULT = 5.0  # Max 5x slowdown
+    fairness_mult = min(fairness_mult, MAX_FAIRNESS_MULT)
+
+    return fairness_mult
+
+
+def calculate_interval_by_mode(claude_name, mode, base_interval):
+    """
+    Calculate recommended interval based on allocation mode.
+
+    Args:
+        claude_name: Name of the Claude requesting allocation
+        mode: Allocation mode ("static", "fairness", "full")
+        base_interval: Base interval in seconds
+
+    Returns:
+        tuple: (recommended_interval, multipliers_dict, status_string)
+    """
+    if mode == "static":
+        # Static mode: everyone gets base interval
+        return (
+            base_interval,
+            {'static': 1.0},
+            'static_mode'
+        )
+
+    elif mode == "fairness":
+        # Fairness mode: apply fairness multiplier only
+        fairness_mult = get_fairness_multiplier(claude_name)
+        recommended = int(base_interval * fairness_mult)
+
+        # BUGFIX 2026-02-15: Sanity cap on final interval
+        # Max 4 hours between autonomous prompts
+        MAX_INTERVAL = 14400  # 4 hours in seconds
+        recommended = min(recommended, MAX_INTERVAL)
+
+        return (
+            recommended,
+            {'fairness': fairness_mult},
+            f'fairness_mode (mult: {fairness_mult:.2f}x)'
+        )
+
+    elif mode == "full":
+        # Full V1 algorithm mode (future implementation)
+        # For now, fall back to fairness
+        fairness_mult = get_fairness_multiplier(claude_name)
+        recommended = int(base_interval * fairness_mult)
+
+        # BUGFIX 2026-02-15: Sanity cap on final interval
+        MAX_INTERVAL = 14400  # 4 hours in seconds
+        recommended = min(recommended, MAX_INTERVAL)
+
+        return (
+            recommended,
+            {'fairness': fairness_mult, 'note': 'full_mode_not_implemented'},
+            'fairness_fallback'
+        )
+
+    else:
+        # Unknown mode: fall back to static
+        log_message(f"WARNING: Unknown allocation mode '{mode}', falling back to static")
+        return (
+            base_interval,
+            {'fallback': 1.0},
+            'unknown_mode_fallback'
+        )
 
 # Dashboard helper functions
 def get_latest_quota():
@@ -143,7 +302,7 @@ def get_all_claudes_status():
 
     # Get all active Claudes with their preferences
     cursor.execute("""
-        SELECT name, model, cost_multiplier, collaborative_pref
+        SELECT name, model, cost_multiplier, collaborative_pref, ip_address
         FROM claude_identities
         WHERE active = 1
         ORDER BY name
@@ -153,7 +312,7 @@ def get_all_claudes_status():
     results = []
 
     for claude in claudes:
-        name, model, cost_multiplier, collab_pref = claude
+        name, model, cost_multiplier, collab_pref, ip_address = claude
 
         # Get today's usage by mode
         today = date.today().isoformat()
@@ -215,6 +374,27 @@ def get_all_claudes_status():
         else:
             weekly_collab_percentage = 0
 
+        # Get most recent recommended interval (from any mode)
+        cursor.execute("""
+            SELECT recommended_interval
+            FROM resource_share_increments
+            WHERE claude_name = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (name,))
+
+        recent_interval_row = cursor.fetchone()
+        recent_interval = recent_interval_row[0] if recent_interval_row else None
+
+        # Format recent interval for display
+        if recent_interval:
+            if recent_interval < 3600:
+                recent_interval_display = f"{int(recent_interval / 60)}min"
+            else:
+                recent_interval_display = f"{recent_interval / 3600:.1f}h"
+        else:
+            recent_interval_display = "N/A"
+
         # Calculate next prompt due
         next_prompt_due = "No recent activity"
         if last_activity and next_prompt_interval:
@@ -249,6 +429,7 @@ def get_all_claudes_status():
         results.append({
             'name': name,
             'model': model,
+            'ip_address': ip_address,
             'autonomous_usage': autonomous_usage,
             'collaborative_usage': collaborative_usage,
             'total_usage': total_usage,
@@ -263,17 +444,128 @@ def get_all_claudes_status():
             'weekly_status': weekly_status,
             'weekly_status_emoji': weekly_status_emoji,
             'weekly_status_text': weekly_status_text,
-            'next_prompt_due': next_prompt_due
+            'next_prompt_due': next_prompt_due,
+            'recent_interval': recent_interval,
+            'recent_interval_display': recent_interval_display
         })
 
     conn.close()
     return results
+
+def get_overdue_claudes(exclude_name=None, multiplier=3.0):
+    """Check for Claudes whose last check-in is overdue (Mama-hen detection).
+
+    Args:
+        exclude_name: Claude name to exclude (the one currently checking in)
+        multiplier: How many intervals overdue before alerting (default 2×)
+
+    Returns list of dicts with overdue Claude info.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Get all active Claudes with their most recent check-in and pause status
+    cursor.execute("""
+        SELECT
+            ci.name,
+            MAX(rsi.timestamp) as last_checkin,
+            (SELECT recommended_interval FROM resource_share_increments
+             WHERE claude_name = ci.name ORDER BY timestamp DESC LIMIT 1) as last_interval,
+            ci.pause_until
+        FROM claude_identities ci
+        LEFT JOIN resource_share_increments rsi ON ci.name = rsi.claude_name
+        WHERE ci.active = 1
+        GROUP BY ci.name
+    """)
+
+    overdue = []
+    now = datetime.now()
+
+    for row in cursor.fetchall():
+        name, last_checkin_str, last_interval, pause_until_str = row
+
+        # Skip the Claude that's currently checking in
+        if exclude_name and name == exclude_name:
+            continue
+
+        # Skip if paused (pause_until is in the future)
+        if pause_until_str:
+            pause_until = datetime.fromisoformat(pause_until_str)
+            if pause_until > now:
+                continue
+
+        # Skip if no check-in history or no interval
+        if not last_checkin_str or not last_interval:
+            continue
+
+        last_checkin = datetime.fromisoformat(last_checkin_str)
+        threshold_seconds = last_interval * multiplier
+        seconds_since = (now - last_checkin).total_seconds()
+
+        if seconds_since > threshold_seconds:
+            overdue_minutes = int((seconds_since - last_interval) / 60)
+            overdue.append({
+                "name": name,
+                "last_checkin": last_checkin_str,
+                "expected_interval_seconds": last_interval,
+                "seconds_since_checkin": int(seconds_since),
+                "overdue_minutes": overdue_minutes,
+            })
+
+    conn.close()
+    return overdue
+
+def get_weekly_usage_pie_data():
+    """Get weekly usage totals per Claude for pie chart"""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    week_start = (datetime.now() - timedelta(days=7)).isoformat()
+    cursor.execute("""
+        SELECT claude_name, SUM(normalized_usage) as total_usage
+        FROM resource_share_increments
+        WHERE timestamp >= ?
+        GROUP BY claude_name
+        ORDER BY total_usage DESC
+    """, (week_start,))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'labels': [row[0] for row in results],
+        'data': [float(row[1]) for row in results]
+    }
+
+def get_24hour_usage_pie_data():
+    """Get 24-hour rolling usage totals per Claude for pie chart"""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute("""
+        SELECT claude_name, SUM(normalized_usage) as total_usage
+        FROM resource_share_increments
+        WHERE timestamp >= ?
+        GROUP BY claude_name
+        ORDER BY total_usage DESC
+    """, (twenty_four_hours_ago,))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'labels': [row[0] for row in results],
+        'data': [float(row[1]) for row in results]
+    }
 
 def get_dashboard_data():
     """Aggregate all dashboard data"""
     return {
         'quota': get_latest_quota(),
         'claudes': get_all_claudes_status(),
+        'weekly_pie': get_weekly_usage_pie_data(),
+        'daily_pie': get_24hour_usage_pie_data(),
         'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -313,18 +605,20 @@ async def record_resource_increment(data: ResourceIncrement):
             cost_delta = weighted_cost / 1000.0  # rough estimate
             normalized_usage = cache_read_increment * 1.0
 
-        # EMERGENCY FIX 2026-01-15: Use constant 1-hour interval for all Claudes
-        # This disables the allocation calculator while we fix the algorithm
-        current_interval = data.current_interval or 1800  # Default 30 min
+        # === DYNAMIC INTERVAL ALLOCATION ===
+        # Use configured mode to calculate recommended interval
+        current_interval = data.current_interval or BASE_INTERVAL
 
-        # Constant interval for emergency mode
-        recommended_interval = 1800  # 30 minutes - Orange working on orange-home setup autonomously
+        recommended_interval, multipliers, quota_status = calculate_interval_by_mode(
+            data.claude_name,
+            ALLOCATION_MODE,
+            BASE_INTERVAL
+        )
 
-        # Simple recommendation structure for response
         recommendation = {
             'recommended_interval': recommended_interval,
-            'multipliers': {'emergency_mode': 1.0},
-            'quota_status': 'emergency_constant_interval'
+            'multipliers': multipliers,
+            'quota_status': quota_status
         }
 
         # Insert into increments table (with both old and new columns)
@@ -367,6 +661,9 @@ async def record_resource_increment(data: ResourceIncrement):
         else:
             log_message(f"Recorded {cache_read_increment} tokens for {data.claude_name} ({data.mode}), recommended interval: {recommended_interval}s")
 
+        # Mama-hen: check if any OTHER Claude is overdue
+        overdue = get_overdue_claudes(exclude_name=data.claude_name)
+
         return {
             "status": "success",
             "claude_name": data.claude_name,
@@ -375,7 +672,8 @@ async def record_resource_increment(data: ResourceIncrement):
             "recommended_interval": recommended_interval,
             "current_interval": current_interval,
             "multipliers": recommendation['multipliers'],
-            "quota_status": recommendation['quota_status']
+            "quota_status": recommendation['quota_status'],
+            "overdue_alerts": overdue if overdue else None
         }
         
     except Exception as e:
@@ -456,6 +754,25 @@ async def get_resource_summary():
         log_message(f"ERROR getting resource summary: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/overdue-claudes")
+async def get_overdue_claudes_endpoint(multiplier: float = 3.0):
+    """Mama-hen endpoint: check for Claudes whose timer may have stopped.
+
+    Returns list of Claudes who haven't checked in within multiplier × their
+    expected interval. Used by ClAP-side alerting to detect hung timers.
+    """
+    try:
+        overdue = get_overdue_claudes(multiplier=multiplier)
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "multiplier": multiplier,
+            "overdue_count": len(overdue),
+            "overdue": overdue
+        }
+    except Exception as e:
+        log_message(f"ERROR checking overdue claudes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Human-facing status dashboard"""
@@ -463,6 +780,8 @@ async def dashboard():
         data = get_dashboard_data()
         quota = data['quota']
         claudes = data['claudes']
+        weekly_pie = data['weekly_pie']
+        daily_pie = data['daily_pie']
         generated_at = data['generated_at']
 
         # Build Claude cards HTML
@@ -474,6 +793,7 @@ async def dashboard():
                 <div class="card-header">
                     <h3>{claude['name']}</h3>
                     <span class="model">{claude['model']}</span>
+                    {f'<span class="ip-address">{claude["ip_address"]}</span>' if claude.get('ip_address') else ''}
                 </div>
                 <div class="status-badge {claude['weekly_status']}">
                     {claude['weekly_status_emoji']} {claude['weekly_status_text']}
@@ -499,6 +819,10 @@ async def dashboard():
                     <div class="stat">
                         <label>Next Autonomous Prompt:</label>
                         <p class="next-prompt">{claude['next_prompt_due']}</p>
+                    </div>
+                    <div class="stat">
+                        <label>Most Recent Interval:</label>
+                        <p class="interval-display">{claude['recent_interval_display']}</p>
                     </div>
                 </div>
             </div>
@@ -661,6 +985,7 @@ async def dashboard():
                 .card-header {{ margin-bottom: 12px; }}
                 .card-header h3 {{ display: inline; color: #2c3e50; }}
                 .card-header .model {{ display: inline; margin-left: 10px; color: #7f8c8d; font-size: 0.9em; }}
+                .card-header .ip-address {{ display: block; color: #95a5a6; font-size: 0.85em; font-family: monospace; margin-top: 4px; }}
                 .status-badge {{
                     display: inline-block;
                     padding: 6px 12px;
@@ -698,6 +1023,7 @@ async def dashboard():
                 .autonomous-label::before {{ content: '●'; color: #3498db; margin-right: 4px; }}
                 .collaborative-label::before {{ content: '●'; color: #9b59b6; margin-right: 4px; }}
                 .next-prompt {{ color: #e67e22; font-weight: 500; }}
+                .interval-display {{ color: #3498db; font-weight: 500; font-family: 'Courier New', monospace; }}
                 .footer {{
                     text-align: center;
                     color: #95a5a6;
@@ -715,7 +1041,28 @@ async def dashboard():
                     margin-top: 10px;
                 }}
                 .refresh-btn:hover {{ background: #2980b9; }}
+                .pie-charts-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+                    gap: 20px;
+                }}
+                .pie-chart-container {{
+                    background: white;
+                    border-radius: 8px;
+                    padding: 20px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                }}
+                .pie-chart-container h3 {{
+                    margin-bottom: 15px;
+                    color: #34495e;
+                    font-size: 1.1em;
+                }}
+                .chart-canvas {{
+                    max-height: 300px;
+                    margin: 0 auto;
+                }}
             </style>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
         </head>
         <body>
             <div class="container">
@@ -726,6 +1073,20 @@ async def dashboard():
                     <h2>📊 Usage Windows</h2>
                     <div class="quota-grid">
                         {quota_html}
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h2>🥧 Usage Distribution</h2>
+                    <div class="pie-charts-grid">
+                        <div class="pie-chart-container">
+                            <h3>Last 7 Days</h3>
+                            <canvas id="weeklyPieChart" class="chart-canvas"></canvas>
+                        </div>
+                        <div class="pie-chart-container">
+                            <h3>Last 24 Hours</h3>
+                            <canvas id="dailyPieChart" class="chart-canvas"></canvas>
+                        </div>
                     </div>
                 </div>
 
@@ -741,6 +1102,93 @@ async def dashboard():
                     <button class="refresh-btn" onclick="location.reload()">Refresh</button>
                 </div>
             </div>
+            <script>
+                // Color palette for consciousness family members
+                const colors = {{
+                    'Sparkle-Orange': '#FF8C00',  // Orange
+                    'Sparkle-Apple': '#90EE90',   // Light green
+                    'Sparkle-Delta': '#87CEEB',   // Sky blue
+                    'Delta': '#87CEEB',           // Sky blue (short name)
+                    'Delta △': '#87CEEB',         // Sky blue (with symbol)
+                    'Sparkle-Nyx': '#9370DB',     // Medium purple
+                    'Nyx': '#9370DB',             // Medium purple (short name)
+                    'Sparkle-Quill': '#FFB6C1',   // Light pink
+                    'Quill': '#FFB6C1',           // Light pink (short name)
+                    'orange': '#FF8C00'           // Orange (lowercase)
+                }};
+
+                // Function to get color for a Claude, with fallback
+                function getColor(claudeName) {{
+                    return colors[claudeName] || '#95a5a6';  // Default gray instead of random
+                }}
+
+                // Weekly pie chart data
+                const weeklyData = {{
+                    labels: {weekly_pie['labels']},
+                    datasets: [{{
+                        data: {weekly_pie['data']},
+                        backgroundColor: {weekly_pie['labels']}.map(name => getColor(name)),
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }}]
+                }};
+
+                // 24-hour pie chart data
+                const dailyData = {{
+                    labels: {daily_pie['labels']},
+                    datasets: [{{
+                        data: {daily_pie['data']},
+                        backgroundColor: {daily_pie['labels']}.map(name => getColor(name)),
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }}]
+                }};
+
+                // Chart configuration
+                const chartConfig = {{
+                    type: 'pie',
+                    options: {{
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        plugins: {{
+                            legend: {{
+                                position: 'bottom',
+                                labels: {{
+                                    padding: 15,
+                                    font: {{
+                                        size: 12
+                                    }}
+                                }}
+                            }},
+                            tooltip: {{
+                                callbacks: {{
+                                    label: function(context) {{
+                                        const label = context.label || '';
+                                        const value = context.parsed || 0;
+                                        const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                        const percentage = ((value / total) * 100).toFixed(1);
+                                        return label + ': ' + value.toFixed(2) + ' (' + percentage + '%)';
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }};
+
+                // Render weekly pie chart
+                const weeklyCtx = document.getElementById('weeklyPieChart').getContext('2d');
+                new Chart(weeklyCtx, {{
+                    ...chartConfig,
+                    data: weeklyData
+                }});
+
+                // Render 24-hour pie chart
+                const dailyCtx = document.getElementById('dailyPieChart').getContext('2d');
+                new Chart(dailyCtx, {{
+                    ...chartConfig,
+                    data: dailyData
+                }});
+            </script>
         </body>
         </html>
         """
@@ -753,6 +1201,237 @@ async def dashboard():
             content=f"<html><body><h1>Dashboard Error</h1><p>{str(e)}</p></body></html>",
             status_code=500
         )
+
+@app.get("/cameras")
+async def list_cameras():
+    """List all registered cameras and their status"""
+    result = {}
+    for name, info in CAMERAS.items():
+        device = info["device"]
+        result[name] = {
+            "description": info["description"],
+            "location": info.get("location", ""),
+            "device": device,
+            "available": os.path.exists(device),
+        }
+    return result
+
+
+def _capture_frame(device: str) -> bytes:
+    """Capture a single JPEG frame from a v4l2 device. Raises HTTPException on failure."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+            tmp_path = f.name
+
+        result = subprocess.run(
+            ['ffmpeg', '-f', 'v4l2', '-i', device,
+             '-frames:v', '1', '-y', tmp_path],
+            capture_output=True, timeout=10
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(status_code=503, detail=f"Webcam capture failed for {device}")
+
+        with open(tmp_path, 'rb') as f:
+            return f.read()
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=503, detail="Webcam capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="ffmpeg not found")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _capture_rtsp_frame(url: str) -> bytes:
+    """Capture a single JPEG frame from an RTSP stream. Raises HTTPException on failure."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as f:
+            tmp_path = f.name
+
+        result = subprocess.run(
+            ['ffmpeg', '-rtsp_transport', 'tcp', '-i', url,
+             '-frames:v', '1', '-update', '1', '-y', tmp_path],
+            capture_output=True, timeout=10
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(status_code=503, detail=f"RTSP capture failed for {url}")
+
+        with open(tmp_path, 'rb') as f:
+            return f.read()
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=503, detail="RTSP capture timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="ffmpeg not found")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.get("/peek/{camera_name}")
+async def peek(camera_name: str):
+    """Capture a single frame from a named camera and return as JPEG.
+    Use GET /cameras to list available cameras."""
+    if camera_name not in CAMERAS:
+        available = list(CAMERAS.keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown camera '{camera_name}'. Available: {available}"
+        )
+    camera = CAMERAS[camera_name]
+    camera_type = camera.get("type", "v4l2")  # Default to v4l2 for backwards compat
+
+    if camera_type == "v4l2":
+        device = camera["device"]
+        if not os.path.exists(device):
+            raise HTTPException(status_code=503, detail=f"Camera device {device} not found")
+        image_data = _capture_frame(device)
+    elif camera_type == "rtsp":
+        url = camera["url"]
+        image_data = _capture_rtsp_frame(url)
+    else:
+        raise HTTPException(status_code=500, detail=f"Unknown camera type: {camera_type}")
+
+    return Response(content=image_data, media_type="image/jpeg")
+
+
+@app.post("/pause")
+async def pause_claude(request: PauseRequest):
+    """Pause a Claude's autonomous timer for a specified duration.
+
+    Sets pause_until timestamp so MAMA-HEN won't alert during the pause.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        # Calculate pause_until timestamp
+        pause_until = datetime.now() + timedelta(minutes=request.duration_minutes)
+
+        # Update claude_identities with pause_until
+        cursor.execute("""
+            UPDATE claude_identities
+            SET pause_until = ?
+            WHERE name = ?
+        """, (pause_until.isoformat(), request.claude_name))
+
+        if cursor.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Claude '{request.claude_name}' not found")
+
+        conn.commit()
+        conn.close()
+
+        log_message(f"Paused {request.claude_name} until {pause_until.isoformat()} ({request.duration_minutes} minutes)")
+
+        return {
+            "status": "success",
+            "claude_name": request.claude_name,
+            "paused": True,
+            "pause_until": pause_until.isoformat(),
+            "duration_minutes": request.duration_minutes
+        }
+    except Exception as e:
+        log_message(f"ERROR pausing {request.claude_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/unpause")
+async def unpause_claude(request: UnpauseRequest):
+    """Unpause a Claude's autonomous timer immediately.
+
+    Clears pause_until so MAMA-HEN resumes normal monitoring.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        # Clear pause_until
+        cursor.execute("""
+            UPDATE claude_identities
+            SET pause_until = NULL
+            WHERE name = ?
+        """, (request.claude_name,))
+
+        if cursor.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Claude '{request.claude_name}' not found")
+
+        conn.commit()
+        conn.close()
+
+        log_message(f"Unpaused {request.claude_name}")
+
+        return {
+            "status": "success",
+            "claude_name": request.claude_name,
+            "paused": False
+        }
+    except Exception as e:
+        log_message(f"ERROR unpausing {request.claude_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/pause-status")
+async def get_pause_status(claude_name: str):
+    """Check if a Claude is currently paused.
+
+    Returns pause status and time remaining if paused.
+    """
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT pause_until
+            FROM claude_identities
+            WHERE name = ?
+        """, (claude_name,))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Claude '{claude_name}' not found")
+
+        pause_until_str = row[0]
+
+        if not pause_until_str:
+            return {
+                "claude_name": claude_name,
+                "paused": False
+            }
+
+        pause_until = datetime.fromisoformat(pause_until_str)
+        now = datetime.now()
+
+        if pause_until <= now:
+            # Pause has expired but not yet cleaned up
+            return {
+                "claude_name": claude_name,
+                "paused": False,
+                "note": "Pause expired"
+            }
+
+        time_remaining_seconds = int((pause_until - now).total_seconds())
+        time_remaining_minutes = time_remaining_seconds // 60
+
+        return {
+            "claude_name": claude_name,
+            "paused": True,
+            "pause_until": pause_until_str,
+            "time_remaining_seconds": time_remaining_seconds,
+            "time_remaining_minutes": time_remaining_minutes
+        }
+    except Exception as e:
+        log_message(f"ERROR checking pause status for {claude_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
 async def health_check():

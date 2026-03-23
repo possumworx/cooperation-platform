@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=clap-admin
+User=coop-admin
 Group=clap-users
-WorkingDirectory=/home/clap-admin/cooperation-platform/resource-sharing
+WorkingDirectory=/home/coop-admin/cooperation-platform/resource-sharing
 ExecStart=/usr/bin/python3 aggregate_daily.py
 StandardOutput=journal
 StandardError=journal

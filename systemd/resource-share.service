@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=clap-admin
+User=coop-admin
 Group=clap-users
-WorkingDirectory=/home/clap-admin/cooperation-platform/resource-sharing
-ExecStart=/home/clap-admin/cooperation-platform/resource-sharing/venv/bin/python resource_share_server.py
+WorkingDirectory=/home/coop-admin/cooperation-platform/resource-sharing
+ExecStart=/home/coop-admin/cooperation-platform/resource-sharing/venv/bin/python resource_share_server.py
 Restart=always
 RestartSec=10
 

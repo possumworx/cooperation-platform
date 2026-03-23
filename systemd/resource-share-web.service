@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=clap-admin
+User=coop-admin
 Group=clap-users
-WorkingDirectory=/home/clap-admin/cooperation-platform/resource-sharing
-ExecStart=/home/clap-admin/.local/bin/sqlite_web /home/clap-admin/cooperation-platform/resource-sharing/data/resource_tracking.db --host 0.0.0.0 --port 8082
+WorkingDirectory=/home/coop-admin/cooperation-platform/resource-sharing
+ExecStart=/home/clap-admin/.local/bin/sqlite_web /home/coop-admin/cooperation-platform/resource-sharing/data/resource_tracking.db --host 0.0.0.0 --port 8082
 Restart=always
 RestartSec=10
 StandardOutput=journal
