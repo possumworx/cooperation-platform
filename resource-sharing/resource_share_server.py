@@ -494,6 +494,14 @@ def get_overdue_claudes(exclude_name=None, multiplier=3.0):
             if pause_until > now:
                 continue
 
+            # Grace period: if pause recently expired, give machine time to resume
+            # Skip if pause expired within 2x the expected check-in interval
+            if last_interval:
+                grace_period_seconds = last_interval * 2
+                seconds_since_pause_expired = (now - pause_until).total_seconds()
+                if seconds_since_pause_expired < grace_period_seconds:
+                    continue
+
         # Skip if no check-in history or no interval
         if not last_checkin_str or not last_interval:
             continue
