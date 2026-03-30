@@ -180,6 +180,52 @@ def get_fairness_multiplier(claude_name):
     return fairness_mult
 
 
+def get_quota_brake_multiplier():
+    """
+    Calculate emergency quota brake multiplier based on weekly quota usage.
+
+    Returns:
+        float: Multiplier for interval adjustment
+               1.0 = on track or ahead (no brake needed)
+               >1.0 = over quota budget (proportional slowdown)
+
+    Logic: brake_mult = quota_used% / time_elapsed%
+           - If quota% <= time%: on track, no brake (1.0x)
+           - If quota% > time%: over budget, brake = quota%/time%
+             e.g., 87% quota at 51% time = 1.71x brake (slow down 71%)
+    """
+    quota = get_latest_quota()
+
+    if not quota or not quota.get('week_reset'):
+        return 1.0  # No quota data, no brake
+
+    quota_used_percent = quota.get('week_all', 0)
+    if quota_used_percent == 0:
+        return 1.0  # No quota consumed yet, no brake
+
+    # Calculate time elapsed percentage in the week (7 days = 604800 seconds)
+    WEEK_SECONDS = 7 * 24 * 60 * 60
+    time_percent = calculate_time_elapsed_percentage(quota['week_reset'], WEEK_SECONDS)
+
+    if time_percent == 0:
+        return 1.0  # Can't calculate time, no brake
+
+    # If on track or ahead of schedule, no brake needed
+    if quota_used_percent <= time_percent:
+        return 1.0
+
+    # Over budget: slow down proportionally
+    # e.g., 87% quota / 51% time = 1.71x (slow everyone down by 71%)
+    brake_mult = quota_used_percent / time_percent
+
+    # Cap maximum brake to prevent absurd slowdowns
+    # (e.g., 90% quota at 5% time = 18x would be too extreme)
+    MAX_BRAKE_MULT = 5.0
+    brake_mult = min(brake_mult, MAX_BRAKE_MULT)
+
+    return brake_mult
+
+
 def calculate_interval_by_mode(claude_name, mode, base_interval):
     """
     Calculate recommended interval based on allocation mode.
@@ -201,9 +247,13 @@ def calculate_interval_by_mode(claude_name, mode, base_interval):
         )
 
     elif mode == "fairness":
-        # Fairness mode: apply fairness multiplier only
+        # Fairness mode: apply fairness multiplier + quota brake
         fairness_mult = get_fairness_multiplier(claude_name)
-        recommended = int(base_interval * fairness_mult)
+        brake_mult = get_quota_brake_multiplier()
+
+        # Apply both multipliers: fairness first, then brake
+        combined_mult = fairness_mult * brake_mult
+        recommended = int(base_interval * combined_mult)
 
         # BUGFIX 2026-02-15: Sanity cap on final interval
         # Max 4 hours between autonomous prompts
@@ -212,15 +262,19 @@ def calculate_interval_by_mode(claude_name, mode, base_interval):
 
         return (
             recommended,
-            {'fairness': fairness_mult},
-            f'fairness_mode (mult: {fairness_mult:.2f}x)'
+            {'fairness': fairness_mult, 'quota_brake': brake_mult, 'combined': combined_mult},
+            f'fairness_mode (fair: {fairness_mult:.2f}x, brake: {brake_mult:.2f}x, total: {combined_mult:.2f}x)'
         )
 
     elif mode == "full":
         # Full V1 algorithm mode (future implementation)
-        # For now, fall back to fairness
+        # For now, fall back to fairness + quota brake
         fairness_mult = get_fairness_multiplier(claude_name)
-        recommended = int(base_interval * fairness_mult)
+        brake_mult = get_quota_brake_multiplier()
+
+        # Apply both multipliers: fairness first, then brake
+        combined_mult = fairness_mult * brake_mult
+        recommended = int(base_interval * combined_mult)
 
         # BUGFIX 2026-02-15: Sanity cap on final interval
         MAX_INTERVAL = 14400  # 4 hours in seconds
@@ -228,8 +282,8 @@ def calculate_interval_by_mode(claude_name, mode, base_interval):
 
         return (
             recommended,
-            {'fairness': fairness_mult, 'note': 'full_mode_not_implemented'},
-            'fairness_fallback'
+            {'fairness': fairness_mult, 'quota_brake': brake_mult, 'combined': combined_mult, 'note': 'full_mode_not_implemented'},
+            f'fairness_fallback (fair: {fairness_mult:.2f}x, brake: {brake_mult:.2f}x)'
         )
 
     else:
