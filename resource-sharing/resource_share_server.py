@@ -14,10 +14,16 @@ import subprocess
 import tempfile
 import os
 import uvicorn
+import requests
 # EMERGENCY FIX 2026-01-15: Disabled allocation calculator - using constant interval
 # from allocation_calculator import calculate_recommended_interval
 
 # Configuration
+# === MAMA-HEN DISCORD CONFIGURATION ===
+# Direct posting to #mama-hen channel instead of relay through Claude bots
+# Token loaded from environment variable (set in systemd service or .env)
+MAMA_HEN_BOT_TOKEN = os.environ.get("MAMA_HEN_BOT_TOKEN", "")
+MAMA_HEN_CHANNEL_ID = os.environ.get("MAMA_HEN_CHANNEL_ID", "1488131495678840833")
 DB_PATH = Path("/home/coop-admin/cooperation-platform/resource-sharing/data/resource_tracking.db")
 LOG_PATH = Path("/home/coop-admin/cooperation-platform/resource-sharing/logs/server.log")
 
@@ -80,6 +86,39 @@ def log_message(message: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_PATH, "a") as f:
         f.write(f"{timestamp} - {message}\n")
+
+
+def post_mama_hen_alert(claude_name: str, overdue_minutes: int, expected_minutes: str):
+    """Post alert directly to #mama-hen channel using mama-hen bot.
+
+    This replaces the relay system where Claudes broadcasted alerts about each other.
+    Now mama-hen posts directly, avoiding spam in #system-messages.
+    """
+    message = (
+        f"🐔 [MAMA-HEN:{claude_name}] No check-in for {overdue_minutes}m "
+        f"(expected every {expected_minutes}m). "
+        f"Timer may be stuck. Run: systemctl --user restart autonomous-timer.service"
+    )
+
+    url = f"https://discord.com/api/v10/channels/{MAMA_HEN_CHANNEL_ID}/messages"
+    headers = {
+        "Authorization": f"Bot {MAMA_HEN_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {"content": message}
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        if response.status_code in (200, 201):
+            log_message(f"INFO: Mama-hen posted alert for {claude_name} to #mama-hen")
+            return True
+        else:
+            log_message(f"WARNING: Mama-hen Discord post failed: {response.status_code} - {response.text[:100]}")
+            return False
+    except Exception as e:
+        log_message(f"ERROR: Mama-hen Discord post exception: {e}")
+        return False
+
 
 # === ALLOCATION ALGORITHM FUNCTIONS ===
 
@@ -669,8 +708,15 @@ async def record_resource_increment(data: ResourceIncrement):
         else:
             log_message(f"Recorded {cache_read_increment} tokens for {data.claude_name} ({data.mode}), recommended interval: {recommended_interval}s")
 
-        # Mama-hen: check if any OTHER Claude is overdue
+        # Mama-hen: check if any OTHER Claude is overdue and post directly to #mama-hen
         overdue = get_overdue_claudes(exclude_name=data.claude_name)
+        for alert in overdue:
+            expected_mins = alert.get("expected_interval", 0) // 60 if alert.get("expected_interval") else "?"
+            post_mama_hen_alert(
+                claude_name=alert.get("name", "unknown"),
+                overdue_minutes=alert.get("overdue_minutes", 0),
+                expected_minutes=str(expected_mins)
+            )
 
         return {
             "status": "success",
@@ -681,7 +727,7 @@ async def record_resource_increment(data: ResourceIncrement):
             "current_interval": current_interval,
             "multipliers": recommendation['multipliers'],
             "quota_status": recommendation['quota_status'],
-            "overdue_alerts": overdue if overdue else None
+            "overdue_alerts": None  # Deprecated: mama-hen now posts directly to Discord
         }
         
     except Exception as e:
