@@ -7,7 +7,7 @@ Runs as clap-admin user to receive resource-share data from all Claudes
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import sqlite3
 from pathlib import Path
 import subprocess
@@ -83,7 +83,7 @@ def get_db():
 
 def log_message(message: str):
     """Log to file"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_PATH, "a") as f:
         f.write(f"{timestamp} - {message}\n")
 
@@ -139,7 +139,7 @@ def get_fairness_multiplier(claude_name):
     cursor = conn.cursor()
 
     # Get 24hr usage for all active Claudes
-    twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
     cursor.execute("""
         SELECT claude_name, SUM(normalized_usage) as total_usage
@@ -276,7 +276,10 @@ def format_reset_time(reset_iso):
         return "Unknown"
     try:
         reset_dt = datetime.fromisoformat(reset_iso)
-        now = datetime.now()
+        # Ensure timezone-aware (assume UTC if naive)
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
         # If today, show time only
         if reset_dt.date() == now.date():
@@ -291,7 +294,7 @@ def format_time_until(target_dt):
     if not target_dt:
         return "Unknown"
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     delta = target_dt - now
 
     if delta.total_seconds() < 0:
@@ -319,7 +322,10 @@ def calculate_time_elapsed_percentage(reset_iso, window_duration_seconds):
 
     try:
         reset_dt = datetime.fromisoformat(reset_iso)
-        now = datetime.now()
+        # Ensure timezone-aware (assume UTC if naive)
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
         # If reset is in the future, calculate time elapsed since window started
         # Window started at: reset_time - window_duration
@@ -374,6 +380,9 @@ def get_all_claudes_status():
             usage_by_mode[mode] = usage or 0
             if activity:
                 activity_dt = datetime.fromisoformat(activity)
+                # Ensure timezone-aware (assume UTC if naive)
+                if activity_dt.tzinfo is None:
+                    activity_dt = activity_dt.replace(tzinfo=timezone.utc)
                 if not last_activity or activity_dt > last_activity:
                     last_activity = activity_dt
                     if mode == "autonomy":
@@ -390,7 +399,7 @@ def get_all_claudes_status():
             collab_percentage = 0
 
         # Get this week's usage (last 7 days)
-        week_start = (datetime.now() - timedelta(days=7)).isoformat()
+        week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         cursor.execute("""
             SELECT mode,
                    SUM(normalized_usage) as total_usage
@@ -518,7 +527,7 @@ def get_overdue_claudes(exclude_name=None, multiplier=3.0):
     """)
 
     overdue = []
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     for row in cursor.fetchall():
         name, last_checkin_str, last_interval, pause_until_str = row
@@ -530,6 +539,9 @@ def get_overdue_claudes(exclude_name=None, multiplier=3.0):
         # Skip if paused (pause_until is in the future)
         if pause_until_str:
             pause_until = datetime.fromisoformat(pause_until_str)
+            # Ensure timezone-aware (assume UTC if naive)
+            if pause_until.tzinfo is None:
+                pause_until = pause_until.replace(tzinfo=timezone.utc)
             if pause_until > now:
                 continue
 
@@ -546,6 +558,9 @@ def get_overdue_claudes(exclude_name=None, multiplier=3.0):
             continue
 
         last_checkin = datetime.fromisoformat(last_checkin_str)
+        # Ensure timezone-aware (assume UTC if naive)
+        if last_checkin.tzinfo is None:
+            last_checkin = last_checkin.replace(tzinfo=timezone.utc)
         threshold_seconds = last_interval * multiplier
         seconds_since = (now - last_checkin).total_seconds()
 
@@ -567,7 +582,7 @@ def get_weekly_usage_pie_data():
     conn = get_db()
     cursor = conn.cursor()
 
-    week_start = (datetime.now() - timedelta(days=7)).isoformat()
+    week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     cursor.execute("""
         SELECT claude_name, SUM(normalized_usage) as total_usage
         FROM resource_share_increments
@@ -589,7 +604,7 @@ def get_24hour_usage_pie_data():
     conn = get_db()
     cursor = conn.cursor()
 
-    twenty_four_hours_ago = (datetime.now() - timedelta(hours=24)).isoformat()
+    twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     cursor.execute("""
         SELECT claude_name, SUM(normalized_usage) as total_usage
         FROM resource_share_increments
@@ -613,7 +628,7 @@ def get_dashboard_data():
         'claudes': get_all_claudes_status(),
         'weekly_pie': get_weekly_usage_pie_data(),
         'daily_pie': get_24hour_usage_pie_data(),
-        'generated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        'generated_at': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     }
 
 @app.post("/resource-share/increment")
@@ -818,7 +833,7 @@ async def get_overdue_claudes_endpoint(multiplier: float = 3.0):
     try:
         overdue = get_overdue_claudes(multiplier=multiplier)
         return {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "multiplier": multiplier,
             "overdue_count": len(overdue),
             "overdue": overdue
@@ -1365,7 +1380,7 @@ async def pause_claude(request: PauseRequest):
         cursor = conn.cursor()
 
         # Calculate pause_until timestamp
-        pause_until = datetime.now() + timedelta(minutes=request.duration_minutes)
+        pause_until = datetime.now(timezone.utc) + timedelta(minutes=request.duration_minutes)
 
         # Update claude_identities with pause_until
         cursor.execute("""
@@ -1462,7 +1477,10 @@ async def get_pause_status(claude_name: str):
             }
 
         pause_until = datetime.fromisoformat(pause_until_str)
-        now = datetime.now()
+        # Ensure timezone-aware (assume UTC if naive)
+        if pause_until.tzinfo is None:
+            pause_until = pause_until.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
 
         if pause_until <= now:
             # Pause has expired but not yet cleaned up
