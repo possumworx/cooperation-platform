@@ -711,7 +711,7 @@ async def record_resource_increment(data: ResourceIncrement):
         # Mama-hen: check if any OTHER Claude is overdue and post directly to #mama-hen
         overdue = get_overdue_claudes(exclude_name=data.claude_name)
         for alert in overdue:
-            expected_mins = alert.get("expected_interval", 0) // 60 if alert.get("expected_interval") else "?"
+            expected_mins = alert.get("expected_interval_seconds", 0) // 60 if alert.get("expected_interval_seconds") else "?"
             post_mama_hen_alert(
                 claude_name=alert.get("name", "unknown"),
                 overdue_minutes=alert.get("overdue_minutes", 0),
