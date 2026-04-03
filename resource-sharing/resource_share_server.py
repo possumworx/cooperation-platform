@@ -399,19 +399,31 @@ def get_all_claudes_status():
     conn = get_db()
     cursor = conn.cursor()
 
-    # Get all active Claudes with their preferences
+    # Get all active Claudes with their preferences and pause status
     cursor.execute("""
-        SELECT name, model, cost_multiplier, collaborative_pref, ip_address
-        FROM claude_identities
-        WHERE active = 1
-        ORDER BY name
+        SELECT ci.name, ci.model, ci.cost_multiplier, ci.collaborative_pref, ci.ip_address, ci.pause_until
+        FROM claude_identities ci
+        WHERE ci.active = 1
+        ORDER BY ci.name
     """)
 
     claudes = cursor.fetchall()
     results = []
+    now = datetime.now(timezone.utc)
 
     for claude in claudes:
-        name, model, cost_multiplier, collab_pref, ip_address = claude
+        name, model, cost_multiplier, collab_pref, ip_address, pause_until_str = claude
+
+        # Check if currently paused
+        is_paused = False
+        pause_until_display = None
+        if pause_until_str:
+            pause_until = datetime.fromisoformat(pause_until_str)
+            if pause_until.tzinfo is None:
+                pause_until = pause_until.replace(tzinfo=timezone.utc)
+            if pause_until > now:
+                is_paused = True
+                pause_until_display = format_time_until(pause_until)
 
         # Get today's usage by mode
         today = date.today().isoformat()
@@ -532,6 +544,8 @@ def get_all_claudes_status():
             'name': name,
             'model': model,
             'ip_address': ip_address,
+            'is_paused': is_paused,
+            'pause_until_display': pause_until_display,
             'autonomous_usage': autonomous_usage,
             'collaborative_usage': collaborative_usage,
             'total_usage': total_usage,
@@ -1074,6 +1088,7 @@ async def dashboard():
                 <div class="status-badge {claude['weekly_status']}">
                     {claude['weekly_status_emoji']} {claude['weekly_status_text']}
                 </div>
+                {f'<div class="pause-badge">⏸️ Paused (resumes {claude["pause_until_display"]})</div>' if claude.get('is_paused') else ''}
                 <div class="usage-stats">
                     <div class="stat">
                         <label>This Week (Last 7 Days):</label>
@@ -1273,6 +1288,16 @@ async def dashboard():
                 .status-badge.available {{ background: #d4edda; color: #155724; }}
                 .status-badge.moderate {{ background: #fff3cd; color: #856404; }}
                 .status-badge.busy {{ background: #f8d7da; color: #721c24; }}
+                .pause-badge {{
+                    padding: 8px 12px;
+                    background: #e3f2fd;
+                    border: 2px solid #2196f3;
+                    border-radius: 6px;
+                    text-align: center;
+                    font-weight: 500;
+                    margin-bottom: 15px;
+                    color: #1976d2;
+                }}
                 .usage-stats .stat {{ margin-bottom: 12px; }}
                 .daily-mini-stat {{
                     padding: 8px 12px;
