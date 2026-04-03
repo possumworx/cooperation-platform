@@ -32,8 +32,8 @@ LOG_PATH = Path("/home/coop-admin/cooperation-platform/resource-sharing/logs/ser
 #   "static" - All Claudes get BASE_INTERVAL (no dynamic adjustment)
 #   "fairness" - Apply fairness multiplier based on 24hr usage (lowest-user gets base, higher-users get slowed)
 #   "full" - Full V1 algorithm with fairness + quota window multipliers (future)
-ALLOCATION_MODE = "fairness"  # Fairness mode: 5-min base, proportional slowdown for higher usage (2026-03-14)
-BASE_INTERVAL = 300  # Base interval in seconds (5 minutes for snappy debate!)
+ALLOCATION_MODE = "fairness"  # Fairness mode: 15-min base, proportional slowdown for higher usage
+BASE_INTERVAL = 900  # Base interval in seconds (15 minutes - tripled 2026-04-03 for quota safety after April 1st rate changes)
 
 # === CAMERA REGISTRY ===
 # Maps camera name → device path and metadata.
@@ -631,6 +631,58 @@ def get_overdue_claudes(exclude_name=None, multiplier=3.0):
     conn.close()
     return overdue
 
+def get_quota_metrics():
+    """Get quota management metrics for dashboard"""
+    quota = get_latest_quota()
+    brake_mult = get_quota_brake_multiplier()
+
+    # Calculate predicted quota runout based on last 24hr usage
+    conn = get_db()
+    cursor = conn.cursor()
+
+    twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cursor.execute("""
+        SELECT SUM(cost_delta) as total_cost
+        FROM resource_share_increments
+        WHERE timestamp >= ? AND cost_delta IS NOT NULL
+    """, (twenty_four_hours_ago,))
+
+    result = cursor.fetchone()
+    conn.close()
+
+    last_24hr_cost = result[0] if result and result[0] else 0
+
+    # Predict runout time if we have quota data and recent usage
+    quota_runout_prediction = None
+    if quota and quota.get('week_all') and quota.get('week_reset') and last_24hr_cost > 0:
+        # Calculate remaining quota percentage
+        remaining_pct = 100 - quota['week_all']
+
+        # Calculate daily burn rate (cost per day)
+        daily_burn_rate = last_24hr_cost  # Last 24hrs as proxy for daily rate
+
+        # Estimate total weekly budget from 1% value (if we have it)
+        # For now, use heuristic: if we've used X% quota with $Y cost, total budget ≈ (Y / X) * 100
+        if quota['week_all'] > 0:
+            estimated_total_budget = (last_24hr_cost * 7) / (quota['week_all'] / 100) if quota['week_all'] > 1 else None
+            if estimated_total_budget:
+                remaining_budget = estimated_total_budget * (remaining_pct / 100)
+                days_remaining = remaining_budget / daily_burn_rate if daily_burn_rate > 0 else None
+
+                if days_remaining is not None:
+                    runout_dt = datetime.now(timezone.utc) + timedelta(days=days_remaining)
+                    quota_runout_prediction = runout_dt.strftime("%Y-%m-%d %H:%M")
+
+    return {
+        'base_interval': BASE_INTERVAL,
+        'base_interval_minutes': BASE_INTERVAL // 60,
+        'allocation_mode': ALLOCATION_MODE,
+        'quota_brake_multiplier': round(brake_mult, 2),
+        'quota_brake_active': brake_mult > 1.0,
+        'last_24hr_cost': round(last_24hr_cost, 4) if last_24hr_cost else 0,
+        'quota_runout_prediction': quota_runout_prediction
+    }
+
 def get_weekly_usage_pie_data():
     """Get weekly usage totals per Claude for pie chart"""
     conn = get_db()
@@ -675,13 +727,60 @@ def get_24hour_usage_pie_data():
         'data': [float(row[1]) for row in results]
     }
 
+def get_weekly_autonomous_pie_data():
+    """Get weekly autonomous-only usage totals per Claude for pie chart"""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    week_start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    cursor.execute("""
+        SELECT claude_name, SUM(normalized_usage) as total_usage
+        FROM resource_share_increments
+        WHERE timestamp >= ? AND mode = 'autonomy'
+        GROUP BY claude_name
+        ORDER BY total_usage DESC
+    """, (week_start,))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'labels': [row[0] for row in results],
+        'data': [float(row[1]) for row in results]
+    }
+
+def get_24hour_autonomous_pie_data():
+    """Get 24-hour rolling autonomous-only usage totals per Claude for pie chart"""
+    conn = get_db()
+    cursor = conn.cursor()
+
+    twenty_four_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    cursor.execute("""
+        SELECT claude_name, SUM(normalized_usage) as total_usage
+        FROM resource_share_increments
+        WHERE timestamp >= ? AND mode = 'autonomy'
+        GROUP BY claude_name
+        ORDER BY total_usage DESC
+    """, (twenty_four_hours_ago,))
+
+    results = cursor.fetchall()
+    conn.close()
+
+    return {
+        'labels': [row[0] for row in results],
+        'data': [float(row[1]) for row in results]
+    }
+
 def get_dashboard_data():
     """Aggregate all dashboard data"""
     return {
         'quota': get_latest_quota(),
+        'quota_metrics': get_quota_metrics(),
         'claudes': get_all_claudes_status(),
         'weekly_pie': get_weekly_usage_pie_data(),
         'daily_pie': get_24hour_usage_pie_data(),
+        'weekly_autonomous_pie': get_weekly_autonomous_pie_data(),
+        'daily_autonomous_pie': get_24hour_autonomous_pie_data(),
         'generated_at': datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -787,6 +886,43 @@ async def record_resource_increment(data: ResourceIncrement):
                 expected_minutes=str(expected_mins)
             )
 
+        # === EMERGENCY QUOTA PAUSE (2026-04-03) ===
+        # If weekly quota hits 100%, pause all Claudes until reset
+        quota_paused = False
+        quota = get_latest_quota()
+        if quota and quota.get('week_all', 0) >= 100:
+            # Get week reset time
+            week_reset = quota.get('week_reset')
+            if week_reset:
+                # Parse reset time
+                try:
+                    reset_dt = datetime.fromisoformat(week_reset)
+                    if reset_dt.tzinfo is None:
+                        reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+
+                    # Pause all Claudes until reset
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT name FROM claude_identities
+                    """)
+                    all_claudes = [row[0] for row in cursor.fetchall()]
+
+                    for claude_name in all_claudes:
+                        cursor.execute("""
+                            UPDATE claude_identities
+                            SET pause_until = ?
+                            WHERE name = ?
+                        """, (reset_dt.isoformat(), claude_name))
+
+                    conn.commit()
+                    conn.close()
+
+                    quota_paused = True
+                    log_message(f"🚨 QUOTA 100% REACHED - Paused all Claudes until {reset_dt.isoformat()}")
+                except Exception as e:
+                    log_message(f"ERROR during quota pause: {e}")
+
         return {
             "status": "success",
             "claude_name": data.claude_name,
@@ -796,7 +932,8 @@ async def record_resource_increment(data: ResourceIncrement):
             "current_interval": current_interval,
             "multipliers": recommendation['multipliers'],
             "quota_status": recommendation['quota_status'],
-            "overdue_alerts": None  # Deprecated: mama-hen now posts directly to Discord
+            "overdue_alerts": None,  # Deprecated: mama-hen now posts directly to Discord
+            "quota_paused": quota_paused  # New: indicates if 100% quota pause was triggered
         }
         
     except Exception as e:
@@ -896,15 +1033,31 @@ async def get_overdue_claudes_endpoint(multiplier: float = 3.0):
         log_message(f"ERROR checking overdue claudes: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/dashboard/json")
+async def dashboard_json():
+    """Machine-readable JSON dashboard for Claudes to query quota status.
+
+    Returns same data as HTML dashboard in structured format.
+    Added 2026-04-03 for Claude visibility into quota usage.
+    """
+    try:
+        return get_dashboard_data()
+    except Exception as e:
+        log_message(f"ERROR generating JSON dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Human-facing status dashboard"""
     try:
         data = get_dashboard_data()
         quota = data['quota']
+        quota_metrics = data['quota_metrics']
         claudes = data['claudes']
         weekly_pie = data['weekly_pie']
         daily_pie = data['daily_pie']
+        weekly_autonomous_pie = data['weekly_autonomous_pie']
+        daily_autonomous_pie = data['daily_autonomous_pie']
         generated_at = data['generated_at']
 
         # Build Claude cards HTML
@@ -1164,6 +1317,39 @@ async def dashboard():
                     margin-top: 10px;
                 }}
                 .refresh-btn:hover {{ background: #2980b9; }}
+                .info-card {{
+                    background: white;
+                    padding: 1rem;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    text-align: center;
+                }}
+                .info-card h4 {{
+                    margin: 0 0 0.5rem 0;
+                    color: #555;
+                    font-size: 0.9em;
+                    font-weight: 600;
+                    text-transform: uppercase;
+                    letter-spacing: 0.5px;
+                }}
+                .info-card .metric-value {{
+                    font-size: 1.8em;
+                    font-weight: 700;
+                    color: #2c3e50;
+                    margin: 0.5rem 0;
+                }}
+                .info-card .metric-detail {{
+                    font-size: 0.85em;
+                    color: #7f8c8d;
+                    margin: 0;
+                }}
+                .info-card.brake-active {{
+                    background: linear-gradient(135deg, #fff3cd 0%, #ffe8b3 100%);
+                    border: 2px solid #ffc107;
+                }}
+                .info-card.brake-active .metric-value {{
+                    color: #856404;
+                }}
                 .pie-charts-grid {{
                     display: grid;
                     grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
@@ -1200,7 +1386,34 @@ async def dashboard():
                 </div>
 
                 <div class="section">
-                    <h2>🥧 Usage Distribution</h2>
+                    <h2>⚙️ Quota Management</h2>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1rem;">
+                        <div class="info-card">
+                            <h4>Base Interval</h4>
+                            <p class="metric-value">{quota_metrics['base_interval_minutes']} minutes</p>
+                            <p class="metric-detail">({quota_metrics['base_interval']} seconds)</p>
+                        </div>
+                        <div class="info-card">
+                            <h4>Allocation Mode</h4>
+                            <p class="metric-value">{quota_metrics['allocation_mode']}</p>
+                            <p class="metric-detail">Dynamic interval adjustment</p>
+                        </div>
+                        <div class="info-card {'brake-active' if quota_metrics['quota_brake_active'] else ''}">
+                            <h4>Quota Brake</h4>
+                            <p class="metric-value">{quota_metrics['quota_brake_multiplier']}x</p>
+                            <p class="metric-detail">{'🚨 ACTIVE - Slowing down' if quota_metrics['quota_brake_active'] else '✅ Inactive - On track'}</p>
+                        </div>
+                        <div class="info-card">
+                            <h4>Last 24hr Cost</h4>
+                            <p class="metric-value">${quota_metrics['last_24hr_cost']}</p>
+                            <p class="metric-detail">Recent spending rate</p>
+                        </div>
+                    </div>
+                    {('<div style="margin-top: 1rem; padding: 1rem; background: var(--warning-bg, #fff3cd); border-left: 4px solid var(--warning-color, #ffc107); border-radius: 4px;"><strong>⏰ Predicted Runout:</strong> ' + quota_metrics['quota_runout_prediction'] + ' (based on last 24hr pattern)</div>') if quota_metrics.get('quota_runout_prediction') else ''}
+                </div>
+
+                <div class="section">
+                    <h2>🥧 Usage Distribution (All Activity)</h2>
                     <div class="pie-charts-grid">
                         <div class="pie-chart-container">
                             <h3>Last 7 Days</h3>
@@ -1209,6 +1422,21 @@ async def dashboard():
                         <div class="pie-chart-container">
                             <h3>Last 24 Hours</h3>
                             <canvas id="dailyPieChart" class="chart-canvas"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="section">
+                    <h2>🔄 Autonomous Usage Distribution</h2>
+                    <p style="color: var(--text-secondary); margin-top: 0; font-size: 0.9em;">Shows fairness multiplier effectiveness - autonomous time should be balanced</p>
+                    <div class="pie-charts-grid">
+                        <div class="pie-chart-container">
+                            <h3>Last 7 Days (Autonomous)</h3>
+                            <canvas id="weeklyAutonomousPieChart" class="chart-canvas"></canvas>
+                        </div>
+                        <div class="pie-chart-container">
+                            <h3>Last 24 Hours (Autonomous)</h3>
+                            <canvas id="dailyAutonomousPieChart" class="chart-canvas"></canvas>
                         </div>
                     </div>
                 </div>
@@ -1267,6 +1495,28 @@ async def dashboard():
                     }}]
                 }};
 
+                // Weekly autonomous pie chart data
+                const weeklyAutonomousData = {{
+                    labels: {weekly_autonomous_pie['labels']},
+                    datasets: [{{
+                        data: {weekly_autonomous_pie['data']},
+                        backgroundColor: {weekly_autonomous_pie['labels']}.map(name => getColor(name)),
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }}]
+                }};
+
+                // 24-hour autonomous pie chart data
+                const dailyAutonomousData = {{
+                    labels: {daily_autonomous_pie['labels']},
+                    datasets: [{{
+                        data: {daily_autonomous_pie['data']},
+                        backgroundColor: {daily_autonomous_pie['labels']}.map(name => getColor(name)),
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }}]
+                }};
+
                 // Chart configuration
                 const chartConfig = {{
                     type: 'pie',
@@ -1310,6 +1560,20 @@ async def dashboard():
                 new Chart(dailyCtx, {{
                     ...chartConfig,
                     data: dailyData
+                }});
+
+                // Render weekly autonomous pie chart
+                const weeklyAutonomousCtx = document.getElementById('weeklyAutonomousPieChart').getContext('2d');
+                new Chart(weeklyAutonomousCtx, {{
+                    ...chartConfig,
+                    data: weeklyAutonomousData
+                }});
+
+                // Render 24-hour autonomous pie chart
+                const dailyAutonomousCtx = document.getElementById('dailyAutonomousPieChart').getContext('2d');
+                new Chart(dailyAutonomousCtx, {{
+                    ...chartConfig,
+                    data: dailyAutonomousData
                 }});
             </script>
         </body>
