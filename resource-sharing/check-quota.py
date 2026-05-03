@@ -115,19 +115,20 @@ def parse_usage_text(text: str) -> dict:
             continue
 
         # Check if this looks like a window label
-        # Must not have progress bar chars or "used" keyword, and must not start with "Resets"
-        if '█' not in line and '% used' not in line and not line.startswith('Resets'):
-            label = line.strip()
-            # Strip animation/spinner characters that appear during UI refresh (fixes "C▌rrent" → "Current")
-            label = re.sub(r'[▌▐▀▄]', '', label)
+        # Strip animation/spinner characters FIRST to handle "█urrent" or "C▌rrent" cases
+        label = line.strip()
+        label_cleaned = re.sub(r'[█▌▐▀▄]', '', label)
+
+        # Must not have progress bar chars (in cleaned version) or "used" keyword, and must not start with "Resets"
+        if '█' not in label_cleaned and '% used' not in label and not label.startswith('Resets'):
             window_type = None
 
-            # Identify which window this is
-            if 'current session' in label.lower():
+            # Identify which window this is (use cleaned label)
+            if 'current session' in label_cleaned.lower():
                 window_type = 'session_5hour'
-            elif 'current week' in label.lower() and 'all models' in label.lower():
+            elif 'current week' in label_cleaned.lower() and 'all models' in label_cleaned.lower():
                 window_type = 'week_all'
-            elif 'current week' in label.lower() and 'sonnet' in label.lower():
+            elif 'current week' in label_cleaned.lower() and 'sonnet' in label_cleaned.lower():
                 window_type = 'week_sonnet'
 
             # Only process if we identified a valid window
