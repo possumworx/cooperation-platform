@@ -118,6 +118,8 @@ def parse_usage_text(text: str) -> dict:
         # Must not have progress bar chars or "used" keyword, and must not start with "Resets"
         if '█' not in line and '% used' not in line and not line.startswith('Resets'):
             label = line.strip()
+            # Strip animation/spinner characters that appear during UI refresh (fixes "C▌rrent" → "Current")
+            label = re.sub(r'[▌▐▀▄]', '', label)
             window_type = None
 
             # Identify which window this is
