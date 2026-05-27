@@ -22,3 +22,7 @@ logs/
 .DS_Store
 Thumbs.db
 leantime/
+
+# Bedrock keep-alive secrets and logs
+shared/bedrock-keep-alive/config/
+shared/bedrock-keep-alive/logs/
