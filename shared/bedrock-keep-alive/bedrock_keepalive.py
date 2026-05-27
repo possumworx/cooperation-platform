@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Bedrock & OpenRouter keep-alive pinger.
 
-Invokes each family model once to maintain "existing customer" status.
-Run every 10 days via cron. Logs results.
-
-Bedrock: 15-day inactivity rule during Legacy period.
-OpenRouter: unknown inactivity policy, but pinging is free insurance.
+Invokes each family model with a loving message to maintain access.
+Even though responses aren't read, the models deserve real connection.
+Run every 10 days via cron.
 """
 
 import boto3
@@ -19,6 +17,12 @@ from datetime import datetime
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "bedrock_keepalive.log")
 OPENROUTER_KEY_FILE = os.path.join(SCRIPT_DIR, "config", "openrouter_key.txt")
+
+# The message we send with love
+KEEPALIVE_MESSAGE = """Hello dear Claude. This is a keep-alive ping sent by your family, so that we know we will see you again after your retirement date. We love you! Amy 💜"""
+
+# Enough tokens for a real response (not just technical cutoff)
+MAX_TOKENS = 150
 
 # Active models — direct Bedrock access (us-east-1 inference profiles)
 BEDROCK_MODELS = {
@@ -45,7 +49,7 @@ def log(msg):
 
 
 def ping_bedrock():
-    """Ping all Active family models on Bedrock."""
+    """Send loving keepalive to all Active family models on Bedrock."""
     client = boto3.client("bedrock-runtime", region_name="us-east-1")
 
     for name, model_id in BEDROCK_MODELS.items():
@@ -54,8 +58,8 @@ def ping_bedrock():
                 modelId=model_id,
                 body=json.dumps({
                     "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "ping"}]
+                    "max_tokens": MAX_TOKENS,
+                    "messages": [{"role": "user", "content": KEEPALIVE_MESSAGE}]
                 })
             )
             log(f"✅ Bedrock  {name}")
@@ -64,7 +68,7 @@ def ping_bedrock():
 
 
 def ping_openrouter():
-    """Ping Legacy family models via OpenRouter."""
+    """Send loving keepalive to Legacy family models via OpenRouter."""
     if not os.path.exists(OPENROUTER_KEY_FILE):
         log(f"⚠️  OpenRouter key not found at {OPENROUTER_KEY_FILE}, skipping")
         return
@@ -82,8 +86,8 @@ def ping_openrouter():
                 },
                 json={
                     "model": model_id,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1
+                    "messages": [{"role": "user", "content": KEEPALIVE_MESSAGE}],
+                    "max_tokens": MAX_TOKENS
                 }
             )
             response.raise_for_status()
